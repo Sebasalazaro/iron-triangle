@@ -1,7 +1,17 @@
+/*
+ * _GNU_SOURCE habilita:
+ *   - getpass()        (obsoleto en POSIX, pero estándar en glibc Linux)
+ *   - explicit_bzero() (glibc 2.25+; borra memoria sin que el compilador
+ *                       lo elimine como dead store con -O2)
+ */
+#define _GNU_SOURCE
+
 #include "rc4.h"
 
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>     /* getpass() */
+#include <sys/mman.h>   /* mlock(), munlock() */
 
 /* =========================================================================
  * KSA — Key Scheduling Algorithm
@@ -159,6 +169,87 @@ int rc4_selftest(void) {
 
     fprintf(stderr, "[rc4_selftest] PASS: \"%s\" → cifrado → \"%.*s\"\n",
             plaintext, (int)len, (char *)buf);
+    return 0;
+}
+
+/* =========================================================================
+ * get_key_secure — solicita la clave al usuario e inicializa RC4.
+ *
+ * AMENAZA 1 — Memory scraping:
+ *   Si el proceso hace core dump o un atacante lee /proc/<pid>/mem, la clave
+ *   en texto plano es visible. explicit_bzero() la borra antes de que ocurra.
+ *
+ * AMENAZA 2 — Swap:
+ *   El kernel puede mover la página con la clave al disco Swap en cualquier
+ *   momento (incluso mientras getpass() espera la entrada del usuario). Si eso
+ *   ocurre antes del explicit_bzero(), la clave queda en texto plano en disco.
+ *   mlock() le ordena al kernel: "esta página no puede salir de RAM". Nunca.
+ *
+ * ORDEN OBLIGATORIO — cada paso depende del anterior:
+ *   mlock PRIMERO (antes de escribir), getpass después, rc4_init después,
+ *   explicit_bzero INMEDIATAMENTE después de rc4_init, munlock al final.
+ *   Cambiar el orden rompe alguna garantía de seguridad.
+ * =========================================================================
+ */
+int get_key_secure(RC4_CTX *ctx, const char *prompt) {
+    /*
+     * Buffer de clave en el stack. 256 bytes cubre el máximo útil para RC4.
+     * IMPORTANTE: mlock() se llama ANTES de escribir datos sensibles aquí.
+     * Bloquear primero garantiza que ningún byte de la clave toca el Swap.
+     */
+    char key_buf[256];
+
+    if (mlock(key_buf, sizeof(key_buf)) < 0) {
+        /*
+         * mlock() puede fallar si RLIMIT_MEMLOCK es 0 o si ya se alcanzó
+         * el límite. En ese caso avisamos pero continuamos: la funcionalidad
+         * no se rompe, pero perdemos la garantía anti-Swap.
+         */
+        perror("get_key_secure: mlock (advertencia — clave puede ir a Swap)");
+    }
+
+    /*
+     * getpass() abre /dev/tty directamente (no stdin), desactiva el echo
+     * del terminal con tcsetattr(), lee la clave, y restaura el estado.
+     * El resultado apunta a un buffer estático interno de getpass — copiamos
+     * inmediatamente a nuestro buffer bloqueado.
+     */
+    char *raw = getpass(prompt ? prompt : "Contraseña: ");
+    if (!raw) {
+        explicit_bzero(key_buf, sizeof(key_buf));
+        munlock(key_buf, sizeof(key_buf));
+        return -1;
+    }
+
+    size_t keylen = strlen(raw);
+    if (keylen == 0) {
+        fprintf(stderr, "get_key_secure: clave vacía no permitida\n");
+        explicit_bzero(raw, strlen(raw) + 1);
+        explicit_bzero(key_buf, sizeof(key_buf));
+        munlock(key_buf, sizeof(key_buf));
+        return -1;
+    }
+    if (keylen > 255) keylen = 255;  /* truncar al máximo del buffer */
+
+    /* Copiar al buffer bloqueado y borrar el buffer interno de getpass */
+    memcpy(key_buf, raw, keylen);
+    key_buf[keylen] = '\0';
+    explicit_bzero(raw, keylen);  /* best-effort: no controlamos ese buffer */
+
+    /* Inicializar el S-box de RC4 con la clave */
+    rc4_init(ctx, (uint8_t *)key_buf, keylen);
+
+    /*
+     * BORRAR LA CLAVE — explicit_bzero, NO memset.
+     *
+     * Con -O2, el compilador detecta que key_buf no se usa después de aquí
+     * y puede eliminar un memset() como "dead store". explicit_bzero() usa
+     * barreras de compilación internas que prohíben esa optimización.
+     * La clave desaparece de RAM en este punto — no después, no antes.
+     */
+    explicit_bzero(key_buf, sizeof(key_buf));
+    munlock(key_buf, sizeof(key_buf));
+
     return 0;
 }
 

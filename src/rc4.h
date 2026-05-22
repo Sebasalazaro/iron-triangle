@@ -46,4 +46,19 @@ void rc4_crypt(RC4_CTX *ctx, uint8_t *data, size_t len);
  */
 int rc4_selftest(void);
 
+/*
+ * get_key_secure — pide la clave al usuario e inicializa el contexto RC4.
+ *
+ * Orden de operaciones:
+ *   1. mlock()        — bloquea el buffer en RAM antes de escribir la clave
+ *   2. getpass()      — lee sin eco; la clave nunca aparece en pantalla
+ *   3. rc4_init()     — inicializa el S-box con la clave
+ *   4. explicit_bzero() — borra la clave inmediatamente de RAM
+ *   5. munlock()      — libera el lock
+ *
+ * prompt: texto mostrado al usuario (NULL usa "Contraseña: ").
+ * Returns 0 en éxito, -1 en error.
+ */
+int get_key_secure(RC4_CTX *ctx, const char *prompt);
+
 #endif /* RC4_H */
