@@ -1,7 +1,7 @@
 CC      = gcc
 CFLAGS  = -Wall -Wextra -O2 -std=c99
 TARGET  = iron-triangle
-SRCS    = src/main.c src/io.c
+SRCS    = src/main.c src/io.c src/lz77.c
 OBJS    = $(SRCS:.c=.o)
 
 all: $(TARGET)
