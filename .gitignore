@@ -1,0 +1,4 @@
+iron-triangle
+src/*.o
+benchmark/results.txt
+*.ite
