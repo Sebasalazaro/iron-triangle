@@ -1,94 +1,81 @@
+<div align="center">
+
 # iron-triangle
 
-Pipeline de compresión + encriptación en C puro para Linux.  
-Proyecto final de Sistemas Operativos — EAFIT.
+Pipeline de compresión + encriptación en C puro para Linux.
+Todo el procesamiento ocurre en RAM; una sola llamada `write()` toca el disco.
+
+<br/>
+
+![C](https://img.shields.io/badge/C99-A8B9CC?style=for-the-badge&logo=c&logoColor=black) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black) ![GCC](https://img.shields.io/badge/GCC-A42E2B?style=for-the-badge&logo=gnu&logoColor=white) ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+
+</div>
 
 ---
 
-## El pipeline
+## Overview
 
-```
-Archivo de entrada
-      │
-      ▼
- [read() × N]          ← lecturas de 4096 bytes (tamaño de página x86)
-      │
-      ▼
- Buffer en RAM
-      │
-      ├─► [LZ77 compress]   ← sliding window 4096 B, look-ahead 16 B
-      │
-      ├─► [RC4 encrypt]     ← KSA + PRGA, clave borrada con explicit_bzero
-      │
-      ▼
- [write() × 1]         ← UNA sola llamada al disco
-      │
-      ▼
- Archivo de salida
-```
+iron-triangle implementa un pipeline `archivo → LZ77 compress → RC4 encrypt → disco` usando únicamente syscalls directas (`open`, `read`, `write`) sin librerías de compresión ni criptografía externas.
 
-**Todo el procesamiento ocurre en RAM. Solo hay una llamada `write()` final.**
+El orden compresión→encriptación es mandatorio: cifrar primero convierte los datos en ruido de máxima entropía, haciendo la compresión posterior matemáticamente imposible. Al comprimir primero, LZ77 explota la redundancia de los datos originales y RC4 protege el resultado compacto.
+
+La clave se solicita con `getpass()`, se bloquea en RAM con `mlock()` para evitar que el kernel la mande al Swap, y se borra con `explicit_bzero()` inmediatamente tras inicializar el cifrador.
 
 ---
 
-## Regla Arquitectónica 6 — Orden obligatorio: comprimir → encriptar
+## Quick Start
 
-La encriptación transforma los datos en ruido pseudoaleatorio de **alta entropía**.  
-Un compresor busca patrones repetitivos: si encriptas primero, no quedan patrones y  
-la compresión es imposible (el archivo incluso puede crecer por la sobrecarga del  
-algoritmo). El orden correcto es:
-
-> **Comprimir primero → Encriptar después**
-
----
-
-## Gestión segura de la clave
-
-1. La clave **nunca** está en el código fuente ni en `argv`.  
-2. Se lee con `getpass()` (sin eco en terminal).  
-3. La página de RAM que la contiene se bloquea con `mlock()` para que el kernel  
-   no la mande al Swap (evita que quede en disco).  
-4. Tras inicializar RC4, se borra con `explicit_bzero()` inmediatamente.
-
----
-
-## Build
+**Requisitos:** gcc, Linux, python3, strace, `/usr/bin/time`
 
 ```bash
-make          # compila iron-triangle
-make test     # roundtrip: comprime → descomprime → diff
-make benchmark
-make clean
-```
+# Compilar
+make
 
-**Requisitos:** gcc, Linux (syscalls POSIX). Sin dependencias externas.
+# Cifrar un archivo (pide contraseña en terminal)
+./iron-triangle -e documento.txt documento.itec
 
----
-
-## Uso
-
-```bash
-# Comprimir + encriptar
-./iron-triangle -e input.txt input.txt.ite
-
-# Desencriptar + descomprimir
-./iron-triangle -d input.txt.ite output.txt
+# Recuperar el archivo original
+./iron-triangle -d documento.itec recuperado.txt
 
 # Verificar integridad
-diff input.txt output.txt && echo "OK"
+diff documento.txt recuperado.txt && echo "OK"
+
+# Ejecutar tests y benchmark
+make test
+make benchmark
 ```
 
 ---
 
-## Restricciones técnicas
+## Arquitectura
 
-| Parámetro | Valor | Razón |
-|---|---|---|
-| Buffer de I/O | 4096 bytes | Tamaño de página x86, alineado al page cache |
-| Sliding window LZ77 | 4096 bytes | Coherente con el tamaño de página |
-| Look-ahead buffer | 16 bytes | Balance compresión/velocidad |
-| Token LZ77 | 3 bytes (offset 12 b \| length 4 b \| literal 8 b) | Cubre toda la ventana con 12 bits |
-| Llamadas `write()` al disco | 1 por archivo | Todo el pipeline vive en RAM |
+```
+Entrada
+  │
+  ▼
+read() × N          ← buffer de 4096 B (= página x86, alineado al page cache)
+  │
+  ▼
+lz77_compress()     ← sliding window 4096 B · look-ahead 16 B · token 3 B
+  │
+  ▼
+rc4_crypt()         ← KSA + PRGA in-place · clave borrada con explicit_bzero
+  │
+  ▼
+write() × 1         ← resultado completo al disco en una sola syscall
+  │
+  ▼
+Salida (.itec)
+```
+
+**Formato de archivo:**
+
+| Magic  | Contenido              | Modo  |
+|--------|------------------------|-------|
+| `LZ77` | header 8B + tokens     | `-c`  |
+| `ITEC` | header 8B + RC4(tokens)| `-e`  |
+
+El header (magic + `original_size`) no se cifra: el decompressor lo necesita para el `malloc()` previo al descifrado.
 
 ---
 
@@ -96,18 +83,43 @@ diff input.txt output.txt && echo "OK"
 
 ```
 iron-triangle/
-├── Makefile
-├── README.md
-├── ANALYSIS.md          # Tabla de benchmark con números reales
-├── SUSTENTACION.md      # Respuestas a preguntas de defensa oral
 ├── src/
-│   ├── main.c           # Orquestación del pipeline
-│   ├── io.c / io.h      # Syscalls open/read/write, buffer 4096
-│   ├── lz77.c / lz77.h  # Compresor/descompresor LZ77
-│   └── rc4.c / rc4.h    # Cifrador RC4 + gestión segura de clave
+│   ├── main.c          # pipeline (-c / -e / -d) y detección de formato
+│   ├── io.c / io.h     # read_file() y write_file() con syscalls directas
+│   ├── lz77.c / lz77.h # compresor y descompresor LZ77 desde cero
+│   └── rc4.c / rc4.h   # RC4 KSA+PRGA + get_key_secure()
 ├── tests/
 │   └── test_roundtrip.sh
-└── benchmark/
-    ├── benchmark.sh
-    └── results.txt
+├── benchmark/
+│   ├── benchmark.sh
+│   └── results.txt
+├── ANALYSIS.md         # tabla benchmark con números reales
+├── SUSTENTACION.md     # respuestas a preguntas de defensa oral
+└── Makefile
 ```
+
+---
+
+## Restricciones técnicas
+
+| Parámetro | Valor | Razón |
+|-----------|-------|-------|
+| Buffer de I/O | 4096 B | Página x86 → alineado al TLB y al page cache |
+| Sliding window | 4096 B | Un escaneo = una entrada TLB, sin TLB misses |
+| Look-ahead | 16 B | 4 bits del token; balance compresión/velocidad |
+| Token LZ77 | 3 B | `offset[12b] \| length[4b] \| literal[8b]` |
+| Llamadas `write()` | 1 | El pipeline completo ocurre en RAM |
+| Cifrado | RC4 | Stream cipher, sin padding, tamaño = tamaño comprimido |
+
+---
+
+## Créditos
+
+Desarrollado por **Sebastian Salazar** — Sistemas Operativos, EAFIT 2026.
+
+Profesor: Edison Valencia
+---
+
+## Licencia
+
+Distribuido bajo la [MIT License](LICENSE).
