@@ -208,33 +208,49 @@ int get_key_secure(RC4_CTX *ctx, const char *prompt) {
         perror("get_key_secure: mlock (advertencia — clave puede ir a Swap)");
     }
 
+    size_t keylen = 0;
+
     /*
-     * getpass() abre /dev/tty directamente (no stdin), desactiva el echo
-     * del terminal con tcsetattr(), lee la clave, y restaura el estado.
-     * El resultado apunta a un buffer estático interno de getpass — copiamos
-     * inmediatamente a nuestro buffer bloqueado.
+     * Fallback para testing automatizado (sin TTY).
+     * NUNCA usar en producción: la clave queda visible en el entorno del proceso
+     * y en /proc/<pid>/environ, que cualquier usuario puede leer.
      */
-    char *raw = getpass(prompt ? prompt : "Contraseña: ");
-    if (!raw) {
-        explicit_bzero(key_buf, sizeof(key_buf));
-        munlock(key_buf, sizeof(key_buf));
-        return -1;
+    const char *env_key = getenv("IRON_TRIANGLE_KEY");
+    if (env_key) {
+        fprintf(stderr, "[WARN] usando IRON_TRIANGLE_KEY — solo para testing\n");
+        keylen = strlen(env_key);
+        if (keylen == 0) {
+            fprintf(stderr, "get_key_secure: IRON_TRIANGLE_KEY vacío\n");
+            explicit_bzero(key_buf, sizeof(key_buf));
+            munlock(key_buf, sizeof(key_buf));
+            return -1;
+        }
+        if (keylen > 255) keylen = 255;
+        memcpy(key_buf, env_key, keylen);
+    } else {
+        /*
+         * Camino normal: getpass() abre /dev/tty directamente (no stdin),
+         * desactiva el echo del terminal con tcsetattr(), lee la clave, y
+         * restaura el estado. Copiamos inmediatamente a nuestro buffer bloqueado.
+         */
+        char *raw = getpass(prompt ? prompt : "Contraseña: ");
+        if (!raw) {
+            explicit_bzero(key_buf, sizeof(key_buf));
+            munlock(key_buf, sizeof(key_buf));
+            return -1;
+        }
+        keylen = strlen(raw);
+        if (keylen == 0) {
+            fprintf(stderr, "get_key_secure: clave vacía no permitida\n");
+            explicit_bzero(raw, keylen + 1);
+            explicit_bzero(key_buf, sizeof(key_buf));
+            munlock(key_buf, sizeof(key_buf));
+            return -1;
+        }
+        if (keylen > 255) keylen = 255;
+        memcpy(key_buf, raw, keylen);
+        explicit_bzero(raw, keylen);  /* best-effort: no controlamos ese buffer */
     }
-
-    size_t keylen = strlen(raw);
-    if (keylen == 0) {
-        fprintf(stderr, "get_key_secure: clave vacía no permitida\n");
-        explicit_bzero(raw, strlen(raw) + 1);
-        explicit_bzero(key_buf, sizeof(key_buf));
-        munlock(key_buf, sizeof(key_buf));
-        return -1;
-    }
-    if (keylen > 255) keylen = 255;  /* truncar al máximo del buffer */
-
-    /* Copiar al buffer bloqueado y borrar el buffer interno de getpass */
-    memcpy(key_buf, raw, keylen);
-    key_buf[keylen] = '\0';
-    explicit_bzero(raw, keylen);  /* best-effort: no controlamos ese buffer */
 
     /* Inicializar el S-box de RC4 con la clave */
     rc4_init(ctx, (uint8_t *)key_buf, keylen);

@@ -1,105 +1,156 @@
+#define _GNU_SOURCE  /* explicit_bzero */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "io.h"
 #include "lz77.h"
+#include "rc4.h"
 
 /*
- * Formato del archivo comprimido (.lz77 / .ite):
- *   Bytes 0-3: magic "LZ77"        — identifica el formato, evita parsear basura
- *   Bytes 4-7: original_size       — uint32_t little-endian, para malloc exacto
- *   Bytes 8+:  stream de tokens    — salida cruda de lz77_compress()
+ * Formatos de archivo soportados:
  *
- * El header nos da el tamaño original sin tener que leer todo el stream primero.
- * Es el mismo principio que el header de gzip (ID1/ID2 + ISIZE).
+ *  "LZ77" — solo compresión (-c / -d):
+ *    Bytes 0-3:  'L' 'Z' '7' '7'
+ *    Bytes 4-7:  original_size  (uint32_t little-endian)
+ *    Bytes 8+:   stream de tokens LZ77
+ *
+ *  "ITEC" — compresión + encriptación (-e / -d):
+ *    Bytes 0-3:  'I' 'T' 'E' 'C'       (IronTriangle Encrypted Compressed)
+ *    Bytes 4-7:  original_size  (uint32_t little-endian)
+ *    Bytes 8+:   RC4( stream de tokens LZ77 )
+ *
+ * El header (8 bytes) NUNCA se encripta: el modo -d necesita leer
+ * original_size antes de poder asignar memoria para la descompresión.
+ * El magic distingue los dos formatos sin ambigüedad.
  */
-static const uint8_t MAGIC[4] = { 'L', 'Z', '7', '7' };
-#define HDR_SIZE 8  /* 4 bytes magic + 4 bytes uint32_t */
+static const uint8_t MAGIC_LZ77[4] = { 'L', 'Z', '7', '7' };
+static const uint8_t MAGIC_ENC[4]  = { 'I', 'T', 'E', 'C' };
+#define HDR_SIZE 8
 
 static void usage(const char *prog) {
     fprintf(stderr,
         "Uso:\n"
         "  %s -c <entrada> <salida>   Comprimir con LZ77\n"
-        "  %s -d <entrada> <salida>   Descomprimir LZ77\n"
-        "  %s -e <entrada> <salida>   Comprimir + Encriptar (Commit 6)\n",
+        "  %s -e <entrada> <salida>   Comprimir LZ77 + Encriptar RC4\n"
+        "  %s -d <entrada> <salida>   Descifrar y/o Descomprimir\n",
         prog, prog, prog);
     exit(1);
 }
 
 /* -------------------------------------------------------------------------
- * do_compress — lee el archivo, comprime en RAM, escribe resultado con header.
- *
- * Flujo:
- *   read_file() → buffer completo en RAM
- *   lz77_compress() → buffer comprimido en RAM (sin I/O)
- *   write_file() → UNA llamada write() al disco
+ * do_compress — LZ77 solo, sin encriptación.
  * -------------------------------------------------------------------------
  */
 static int do_compress(const char *in_path, const char *out_path) {
     uint8_t *src = NULL;
     size_t   src_len = 0;
+    if (read_file(in_path, &src, &src_len) < 0) return 1;
 
-    if (read_file(in_path, &src, &src_len) < 0)
-        return 1;
+    size_t   cap = src_len * LZ77_TOKEN_BYTES + HDR_SIZE;
+    uint8_t *buf = malloc(cap);
+    if (!buf) { perror("malloc"); free(src); return 1; }
 
-    /* Reservar peor caso: cada byte → 1 token de 3 bytes */
-    size_t   comp_cap = src_len * LZ77_TOKEN_BYTES + HDR_SIZE;
-    uint8_t *out_buf  = malloc(comp_cap);
-    if (!out_buf) {
-        perror("do_compress: malloc");
-        free(src);
-        return 1;
-    }
-
-    /* Comprimir a partir del byte HDR_SIZE (dejamos espacio para el header) */
-    ssize_t comp_len = lz77_compress(src, src_len,
-                                     out_buf + HDR_SIZE,
-                                     comp_cap  - HDR_SIZE);
-    if (comp_len < 0) {
-        free(src);
-        free(out_buf);
-        return 1;
-    }
-
-    /* Escribir header: magic + tamaño original */
-    memcpy(out_buf, MAGIC, 4);
-    uint32_t orig32 = (uint32_t)src_len;
-    memcpy(out_buf + 4, &orig32, 4);  /* little-endian en x86 */
-
-    size_t total = HDR_SIZE + (size_t)comp_len;
-    if (write_file(out_path, out_buf, total) < 0) {
-        free(src);
-        free(out_buf);
-        return 1;
-    }
-
-    fprintf(stderr, "[lz77] compress: %zu → %zd bytes (ratio %.1f%%)\n",
-            src_len, comp_len, 100.0 * (double)comp_len / (double)src_len);
-
+    ssize_t comp_len = lz77_compress(src, src_len, buf + HDR_SIZE, cap - HDR_SIZE);
+    uint32_t orig32  = (uint32_t)src_len;
     free(src);
-    free(out_buf);
-    return 0;
+    if (comp_len < 0) { free(buf); return 1; }
+
+    memcpy(buf, MAGIC_LZ77, 4);
+    memcpy(buf + 4, &orig32, 4);
+
+    fprintf(stderr, "[lz77]     %u → %zd bytes (%.1f%%)\n",
+            orig32, comp_len, 100.0 * (double)comp_len / (double)orig32);
+
+    int ret = write_file(out_path, buf, HDR_SIZE + (size_t)comp_len);
+    free(buf);
+    return ret < 0 ? 1 : 0;
 }
 
 /* -------------------------------------------------------------------------
- * do_decompress — lee el archivo comprimido, descomprime en RAM, escribe.
+ * do_encrypt — pipeline completo: LZ77 compress → RC4 encrypt → write.
  *
- * Lee el header para saber el tamaño original → malloc exacto →
- * lz77_decompress() → write_file().
+ * Todo ocurre en RAM. El orden es obligatorio por entropía:
+ *   comprimir PRIMERO (los datos tienen patrones) →
+ *   encriptar DESPUÉS  (los datos cifrados tienen alta entropía y no comprimen).
+ *
+ * Flujo de memoria:
+ *   src_buf  (input original)
+ *      │  lz77_compress()
+ *      ▼
+ *   out_buf+HDR_SIZE  (tokens LZ77 en RAM)
+ *      │  rc4_crypt() in-place
+ *      ▼
+ *   out_buf+HDR_SIZE  (tokens cifrados en RAM)
+ *      │  write_file() — UNA sola syscall write()
+ *      ▼
+ *   disco
+ * -------------------------------------------------------------------------
+ */
+static int do_encrypt(const char *in_path, const char *out_path) {
+    uint8_t *src = NULL;
+    size_t   src_len = 0;
+    if (read_file(in_path, &src, &src_len) < 0) return 1;
+
+    /* Reservar: header + peor caso LZ77 (sin matches: 3 bytes por byte) */
+    size_t   cap = src_len * LZ77_TOKEN_BYTES + HDR_SIZE;
+    uint8_t *buf = malloc(cap);
+    if (!buf) { perror("malloc"); free(src); return 1; }
+
+    /* Stage 1: comprimir en RAM (dejar espacio para el header al inicio) */
+    ssize_t comp_len = lz77_compress(src, src_len, buf + HDR_SIZE, cap - HDR_SIZE);
+    uint32_t orig32  = (uint32_t)src_len;
+    free(src);
+    if (comp_len < 0) { free(buf); return 1; }
+
+    fprintf(stderr, "[lz77]     %u → %zd bytes (%.1f%%)\n",
+            orig32, comp_len, 100.0 * (double)comp_len / (double)orig32);
+
+    /*
+     * Stage 2: obtener clave e inicializar RC4.
+     * get_key_secure() ejecuta: mlock → getpass → rc4_init → explicit_bzero → munlock
+     * Al retornar, la clave ya fue borrada de RAM. El S-box de ctx está listo.
+     */
+    RC4_CTX ctx;
+    if (get_key_secure(&ctx, "Contraseña de cifrado: ") < 0) {
+        free(buf);
+        return 1;
+    }
+
+    /* Stage 3: cifrar el stream comprimido in-place (XOR con keystream RC4) */
+    rc4_crypt(&ctx, buf + HDR_SIZE, (size_t)comp_len);
+    explicit_bzero(&ctx, sizeof(ctx));  /* borrar S-box del contexto */
+
+    /* Escribir header "ITEC" + stream cifrado en una sola llamada write() */
+    memcpy(buf, MAGIC_ENC, 4);
+    memcpy(buf + 4, &orig32, 4);
+
+    fprintf(stderr, "[rc4]      cifrado in-place (%zd bytes)\n", comp_len);
+    fprintf(stderr, "[write]    → %s\n", out_path);
+
+    int ret = write_file(out_path, buf, HDR_SIZE + (size_t)comp_len);
+    free(buf);
+    return ret < 0 ? 1 : 0;
+}
+
+/* -------------------------------------------------------------------------
+ * do_decompress — inversa automática según el magic del archivo.
+ *
+ *  "LZ77": solo descomprimir (sin pedir clave)
+ *  "ITEC": RC4 decrypt in-place → LZ77 decompress
+ *
+ * El header nunca fue cifrado, así que podemos leer el magic y
+ * original_size antes de pedir la clave o asignar memoria.
  * -------------------------------------------------------------------------
  */
 static int do_decompress(const char *in_path, const char *out_path) {
     uint8_t *src = NULL;
     size_t   src_len = 0;
+    if (read_file(in_path, &src, &src_len) < 0) return 1;
 
-    if (read_file(in_path, &src, &src_len) < 0)
-        return 1;
-
-    /* Validar header */
-    if (src_len < HDR_SIZE || memcmp(src, MAGIC, 4) != 0) {
-        fprintf(stderr, "do_decompress: '%s' no es un archivo LZ77 válido\n",
-                in_path);
+    if (src_len < HDR_SIZE) {
+        fprintf(stderr, "error: archivo demasiado pequeño\n");
         free(src);
         return 1;
     }
@@ -107,50 +158,58 @@ static int do_decompress(const char *in_path, const char *out_path) {
     uint32_t orig_size;
     memcpy(&orig_size, src + 4, 4);
 
+    uint8_t *token_stream = src + HDR_SIZE;
+    size_t   token_len    = src_len - HDR_SIZE;
+
+    if (memcmp(src, MAGIC_ENC, 4) == 0) {
+        /*
+         * Formato ITEC: descifrar primero.
+         * Misma función rc4_crypt(), mismo orden: XOR es su propio inverso.
+         * El S-box se reinicializa desde cero con la misma clave → mismo keystream.
+         */
+        RC4_CTX ctx;
+        if (get_key_secure(&ctx, "Contraseña de descifrado: ") < 0) {
+            free(src);
+            return 1;
+        }
+        rc4_crypt(&ctx, token_stream, token_len);
+        explicit_bzero(&ctx, sizeof(ctx));
+
+        fprintf(stderr, "[rc4]      descifrado in-place (%zu bytes)\n", token_len);
+
+    } else if (memcmp(src, MAGIC_LZ77, 4) != 0) {
+        fprintf(stderr, "error: formato desconocido (magic inválido)\n");
+        free(src);
+        return 1;
+    }
+
+    /* Descomprimir (común para ambos formatos) */
     uint8_t *out_buf = malloc(orig_size);
-    if (!out_buf) {
-        perror("do_decompress: malloc");
-        free(src);
-        return 1;
-    }
+    if (!out_buf) { perror("malloc"); free(src); return 1; }
 
-    ssize_t decomp_len = lz77_decompress(src + HDR_SIZE, src_len - HDR_SIZE,
+    ssize_t decomp_len = lz77_decompress(token_stream, token_len,
                                          out_buf, (size_t)orig_size);
-    if (decomp_len < 0) {
-        free(src);
-        free(out_buf);
-        return 1;
-    }
-
-    if (write_file(out_path, out_buf, (size_t)decomp_len) < 0) {
-        free(src);
-        free(out_buf);
-        return 1;
-    }
-
-    fprintf(stderr, "[lz77] decompress: %zu → %zd bytes\n",
-            src_len - HDR_SIZE, decomp_len);
-
     free(src);
+    if (decomp_len < 0) { free(out_buf); return 1; }
+
+    fprintf(stderr, "[lz77]     descomprimido → %zd bytes\n", decomp_len);
+    fprintf(stderr, "[write]    → %s\n", out_path);
+
+    int ret = write_file(out_path, out_buf, (size_t)decomp_len);
     free(out_buf);
-    return 0;
+    return ret < 0 ? 1 : 0;
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 4)
-        usage(argv[0]);
+    if (argc != 4) usage(argv[0]);
 
     const char *mode     = argv[1];
     const char *in_path  = argv[2];
     const char *out_path = argv[3];
 
     if (strcmp(mode, "-c") == 0) return do_compress(in_path, out_path);
+    if (strcmp(mode, "-e") == 0) return do_encrypt(in_path, out_path);
     if (strcmp(mode, "-d") == 0) return do_decompress(in_path, out_path);
-
-    if (strcmp(mode, "-e") == 0) {
-        fprintf(stderr, "[-e] pipeline completo no implementado aún (Commit 6)\n");
-        return 1;
-    }
 
     usage(argv[0]);
     return 1;
