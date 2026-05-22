@@ -22,7 +22,7 @@
  * 16 bytes of lookahead is a sweet spot for text: most useful repetitions
  * (common words, phrases, indentation) fall within this window.
  */
-#define LZ77_LOOKAHEAD_SIZE 16
+#define LZ77_LOOKAHEAD_SIZE 15
 
 /*
  * LZ77Token — internal representation of a single compressed unit.

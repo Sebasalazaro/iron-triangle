@@ -1,7 +1,6 @@
 #!/bin/bash
 # test_roundtrip.sh — verifica roundtrip LZ77 y pipeline completo LZ77+RC4.
 # Uso: bash tests/test_roundtrip.sh  (desde la raíz del repo, después de make)
-set -e
 
 BINARY="./iron-triangle"
 PASS=0
@@ -12,17 +11,30 @@ NC='\033[0m'
 
 # -------------------------------------------------------------------------
 # run_test_lz77 <nombre> <archivo>
-#   Prueba el pipeline de compresión solo (-c / -d).
 # -------------------------------------------------------------------------
 run_test_lz77() {
     local name="$1"
     local input="$2"
-    local comp="/tmp/it_$$.lz77"
-    local out="/tmp/it_$$.out"
+    local comp="/tmp/it_lz77_$$.tmp"
+    local out="/tmp/it_out_$$.tmp"
 
-    "$BINARY" -c "$input" "$comp" 2>/dev/null
-    "$BINARY" -d "$comp"  "$out"  2>/dev/null
+    # Comprimir — mostrar stderr para ver errores reales
+    if ! "$BINARY" -c "$input" "$comp" 2>&1; then
+        printf "${RED}FAIL${NC}  [lz77]  %-28s  error en compress\n" "$name"
+        FAIL=$((FAIL + 1))
+        rm -f "$comp" "$out"
+        return
+    fi
 
+    # Descomprimir
+    if ! "$BINARY" -d "$comp" "$out" 2>&1; then
+        printf "${RED}FAIL${NC}  [lz77]  %-28s  error en decompress\n" "$name"
+        FAIL=$((FAIL + 1))
+        rm -f "$comp" "$out"
+        return
+    fi
+
+    # Comparar bit a bit
     local orig_sz comp_sz ratio
     orig_sz=$(wc -c < "$input")
     comp_sz=$(wc -c < "$comp")
@@ -42,17 +54,27 @@ run_test_lz77() {
 
 # -------------------------------------------------------------------------
 # run_test_pipeline <nombre> <archivo> <clave>
-#   Prueba el pipeline completo (-e / -d) con IRON_TRIANGLE_KEY.
 # -------------------------------------------------------------------------
 run_test_pipeline() {
     local name="$1"
     local input="$2"
     local key="$3"
-    local enc="/tmp/it_$$.itec"
-    local out="/tmp/it_$$.out"
+    local enc="/tmp/it_enc_$$.tmp"
+    local out="/tmp/it_out_$$.tmp"
 
-    IRON_TRIANGLE_KEY="$key" "$BINARY" -e "$input" "$enc" 2>/dev/null
-    IRON_TRIANGLE_KEY="$key" "$BINARY" -d "$enc"   "$out" 2>/dev/null
+    if ! IRON_TRIANGLE_KEY="$key" "$BINARY" -e "$input" "$enc" 2>&1; then
+        printf "${RED}FAIL${NC}  [pipe]  %-28s  error en encrypt\n" "$name"
+        FAIL=$((FAIL + 1))
+        rm -f "$enc" "$out"
+        return
+    fi
+
+    if ! IRON_TRIANGLE_KEY="$key" "$BINARY" -d "$enc" "$out" 2>&1; then
+        printf "${RED}FAIL${NC}  [pipe]  %-28s  error en decrypt\n" "$name"
+        FAIL=$((FAIL + 1))
+        rm -f "$enc" "$out"
+        return
+    fi
 
     local orig_sz enc_sz ratio
     orig_sz=$(wc -c < "$input")
@@ -65,7 +87,6 @@ run_test_pipeline() {
         PASS=$((PASS + 1))
     else
         printf "${RED}FAIL${NC}  [pipe]  %-28s  output difiere del input\n" "$name"
-        diff "$input" "$out" | head -5 || true
         FAIL=$((FAIL + 1))
     fi
     rm -f "$enc" "$out"
@@ -73,22 +94,21 @@ run_test_pipeline() {
 
 # -------------------------------------------------------------------------
 # run_test_wrong_key <nombre> <archivo>
-#   Verifica que una clave incorrecta produce output diferente al original.
 # -------------------------------------------------------------------------
 run_test_wrong_key() {
     local name="$1"
     local input="$2"
-    local enc="/tmp/it_$$.itec"
-    local out="/tmp/it_$$.out"
+    local enc="/tmp/it_enc_$$.tmp"
+    local out="/tmp/it_out_$$.tmp"
 
-    IRON_TRIANGLE_KEY="clave_correcta" "$BINARY" -e "$input" "$enc" 2>/dev/null
-    IRON_TRIANGLE_KEY="clave_INCORRECTA" "$BINARY" -d "$enc" "$out" 2>/dev/null || true
+    IRON_TRIANGLE_KEY="clave_correcta"  "$BINARY" -e "$input" "$enc" 2>/dev/null
+    IRON_TRIANGLE_KEY="clave_INCORRECTA" "$BINARY" -d "$enc"   "$out" 2>/dev/null || true
 
     if ! diff -q "$input" "$out" > /dev/null 2>&1; then
         printf "${GRN}PASS${NC}  [sec]   %-28s  clave incorrecta → output diferente\n" "$name"
         PASS=$((PASS + 1))
     else
-        printf "${RED}FAIL${NC}  [sec]   %-28s  clave incorrecta devolvió el original!\n" "$name"
+        printf "${RED}FAIL${NC}  [sec]   %-28s  clave incorrecta devolvió el original\n" "$name"
         FAIL=$((FAIL + 1))
     fi
     rm -f "$enc" "$out"
@@ -103,28 +123,31 @@ fi
 echo "=== iron-triangle — Roundtrip Tests ==="
 echo ""
 
-# --- Generar archivos de prueba temporales ---
-
-T_REPET="/tmp/it_test_repet_$$.txt"
+# --- Generar archivos de prueba ---
+T_REPET="/tmp/it_repet_$$.txt"
 python3 -c "
+import sys
 line = 'the quick brown fox jumps over the lazy dog\n'
-print((line * 50 + 'abcdef\n' * 20) * 40, end='')
+block = (line * 50 + 'abcdef\n' * 20)
+data  = (block * 40).encode()
+sys.stdout.buffer.write(data)
 " > "$T_REPET"
 
-T_SMALL="/tmp/it_test_small_$$.txt"
-printf "hola mundo\nesto es una prueba de roundtrip\n" > "$T_SMALL"
+T_SMALL="/tmp/it_small_$$.txt"
+printf 'hola mundo\nesto es una prueba de roundtrip\n' > "$T_SMALL"
 
-T_ONEBYTE="/tmp/it_test_1b_$$.txt"
-printf "X" > "$T_ONEBYTE"
+T_ONEBYTE="/tmp/it_one_$$.txt"
+printf 'X' > "$T_ONEBYTE"
 
-T_CODE="/tmp/it_test_code_$$.c"
+T_CODE="/tmp/it_code_$$.c"
 python3 -c "
-lines=['#include <stdio.h>\n','int main(void){\n','    printf(\"hi\\n\");\n','    return 0;\n','}\n']
 import sys
-[sys.stdout.write(l) for _ in range(400) for l in lines]
+lines = ['#include <stdio.h>\n','int main(void) {\n','    return 0;\n','}\n']
+data  = (''.join(lines) * 400).encode()
+sys.stdout.buffer.write(data)
 " > "$T_CODE"
 
-T_RUNS="/tmp/it_test_runs_$$.bin"
+T_RUNS="/tmp/it_runs_$$.bin"
 python3 -c "
 import sys
 sys.stdout.buffer.write(b'A'*4096 + b'B'*4096 + b'AB'*2048 + b'\x00'*4096)
@@ -132,21 +155,21 @@ sys.stdout.buffer.write(b'A'*4096 + b'B'*4096 + b'AB'*2048 + b'\x00'*4096)
 
 # =========================================================================
 echo "--- LZ77 (solo compresión) ---"
-run_test_lz77 "texto repetitivo (200 KB)" "$T_REPET"
-run_test_lz77 "archivo pequeño"           "$T_SMALL"
-run_test_lz77 "un solo byte"              "$T_ONEBYTE"
-run_test_lz77 "código fuente (12 KB)"     "$T_CODE"
-run_test_lz77 "runs de bytes (16 KB)"     "$T_RUNS"
+run_test_lz77 "texto repetitivo (~200 KB)" "$T_REPET"
+run_test_lz77 "archivo pequeño"            "$T_SMALL"
+run_test_lz77 "un solo byte"               "$T_ONEBYTE"
+run_test_lz77 "código fuente (~12 KB)"     "$T_CODE"
+run_test_lz77 "runs de bytes (16 KB)"      "$T_RUNS"
 
 echo ""
 echo "--- Pipeline completo (LZ77 + RC4) ---"
-run_test_pipeline "texto repetitivo"  "$T_REPET"    "mi_clave_secreta"
-run_test_pipeline "archivo pequeño"   "$T_SMALL"    "otra_clave_123"
-run_test_pipeline "un solo byte"      "$T_ONEBYTE"  "x"
-run_test_pipeline "runs de bytes"     "$T_RUNS"     "clave_con_espacios y símbolos!"
+run_test_pipeline "texto repetitivo"  "$T_REPET"   "mi_clave_secreta"
+run_test_pipeline "archivo pequeño"   "$T_SMALL"   "otra_clave_123"
+run_test_pipeline "un solo byte"      "$T_ONEBYTE" "x"
+run_test_pipeline "runs de bytes"     "$T_RUNS"    "clave con espacios!"
 
 echo ""
-echo "--- Seguridad: clave incorrecta debe producir output diferente ---"
+echo "--- Seguridad: clave incorrecta ---"
 run_test_wrong_key "clave incorrecta" "$T_SMALL"
 
 # =========================================================================
@@ -155,4 +178,8 @@ rm -f "$T_REPET" "$T_SMALL" "$T_ONEBYTE" "$T_CODE" "$T_RUNS"
 echo ""
 echo "Resultados: $PASS passed, $FAIL failed"
 echo ""
-[ "$FAIL" -eq 0 ]
+
+if [ "$FAIL" -gt 0 ]; then
+    exit 1
+fi
+exit 0

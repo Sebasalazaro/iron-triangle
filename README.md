@@ -106,7 +106,7 @@ iron-triangle/
 |-----------|-------|-------|
 | Buffer de I/O | 4096 B | Página x86 → alineado al TLB y al page cache |
 | Sliding window | 4096 B | Un escaneo = una entrada TLB, sin TLB misses |
-| Look-ahead | 16 B | 4 bits del token; balance compresión/velocidad |
+| Look-ahead | 15 B | 4 bits del token (0..15); valor máximo codificable |
 | Token LZ77 | 3 B | `offset[12b] \| length[4b] \| literal[8b]` |
 | Llamadas `write()` | 1 | El pipeline completo ocurre en RAM |
 | Cifrado | RC4 | Stream cipher, sin padding, tamaño = tamaño comprimido |
