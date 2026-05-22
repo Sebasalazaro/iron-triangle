@@ -10,6 +10,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>     /* getenv() */
 #include <unistd.h>     /* getpass() */
 #include <sys/mman.h>   /* mlock(), munlock() */
 
