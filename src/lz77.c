@@ -167,13 +167,75 @@ ssize_t lz77_compress(const uint8_t *src, size_t src_len,
 }
 
 /* -------------------------------------------------------------------------
- * lz77_decompress — implementado en Commit 3 (junto con test_roundtrip.sh).
+ * lz77_decompress — decodifica un stream de tokens LZ77 al dato original.
+ *
+ * Por cada token de 3 bytes:
+ *   1. Extrae offset (12 bits), length (4 bits), literal (8 bits)
+ *   2. Si length > 0: copia `length` bytes desde out[out_pos - offset]
+ *      → copia byte a byte para soportar matches solapados (overlapping).
+ *        memcpy no sirve aquí: no garantiza orden, rompería el patrón.
+ *   3. Añade el literal byte al final.
+ *
+ * Invariante: la entrada debe ser múltiplo de LZ77_TOKEN_BYTES (3 bytes).
+ * Returns bytes escritos en dst, o -1 en error.
  * -------------------------------------------------------------------------
  */
 ssize_t lz77_decompress(const uint8_t *src, size_t src_len,
                         uint8_t *dst, size_t dst_len)
 {
-    (void)src; (void)src_len; (void)dst; (void)dst_len;
-    fprintf(stderr, "lz77_decompress: not yet implemented (Commit 3)\n");
-    return -1;
+    if (!src || !dst || src_len == 0) return 0;
+
+    if (src_len % LZ77_TOKEN_BYTES != 0) {
+        fprintf(stderr, "lz77_decompress: src length (%zu) not a multiple of %d\n",
+                src_len, LZ77_TOKEN_BYTES);
+        return -1;
+    }
+
+    size_t src_pos = 0;
+    size_t dst_pos = 0;
+
+    while (src_pos < src_len) {
+        /* Deserializar 3 bytes → offset (12b), length (4b), literal (8b) */
+        uint8_t  b0 = src[src_pos];
+        uint8_t  b1 = src[src_pos + 1];
+        uint8_t  b2 = src[src_pos + 2];
+        src_pos += LZ77_TOKEN_BYTES;
+
+        uint16_t offset  = ((uint16_t)b0 << 4) | (b1 >> 4);
+        uint8_t  length  = b1 & 0x0F;
+        uint8_t  literal = b2;
+
+        /* Fase 1: copiar `length` bytes del back-reference */
+        if (length > 0) {
+            if (dst_pos < (size_t)offset) {
+                fprintf(stderr,
+                        "lz77_decompress: back-reference offset=%u exceeds "
+                        "output position %zu\n", offset, dst_pos);
+                return -1;
+            }
+            size_t match_start = dst_pos - offset;
+            for (uint8_t m = 0; m < length; m++) {
+                if (dst_pos >= dst_len) {
+                    fprintf(stderr, "lz77_decompress: dst buffer overflow\n");
+                    return -1;
+                }
+                /*
+                 * Copia byte a byte — no memcpy.
+                 * Cuando match_start + m >= dst_pos original, estamos leyendo
+                 * bytes que acabamos de escribir: eso es intencional y produce
+                 * el efecto "run" de los matches solapados.
+                 */
+                dst[dst_pos++] = dst[match_start + m];
+            }
+        }
+
+        /* Fase 2: escribir el literal byte */
+        if (dst_pos >= dst_len) {
+            fprintf(stderr, "lz77_decompress: dst buffer overflow on literal\n");
+            return -1;
+        }
+        dst[dst_pos++] = literal;
+    }
+
+    return (ssize_t)dst_pos;
 }
