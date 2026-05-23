@@ -5,6 +5,9 @@
 Pipeline de compresión + encriptación en C puro para Linux.
 Todo el procesamiento ocurre en RAM; una sola llamada `write()` toca el disco.
 
+<img src="public/Benchmark.gif" alt="Benchmark demo" />
+
+<br/>
 <br/>
 
 ![C](https://img.shields.io/badge/C99-A8B9CC?style=for-the-badge&logo=c&logoColor=black) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black) ![GCC](https://img.shields.io/badge/GCC-A42E2B?style=for-the-badge&logo=gnu&logoColor=white) ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
